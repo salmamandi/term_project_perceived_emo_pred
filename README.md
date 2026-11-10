@@ -1,4 +1,3 @@
-
 # Decoupled Valence–Arousal Prediction: Movie-Level 8-Fold Training and Ensemble Evaluation
 
 ## Purpose
@@ -6,11 +5,134 @@
 This README documents two scripts intended for students who will **reuse the same model architecture and training/evaluation procedure on another dataset**:
 
 1. `train_8fold_no_judge_decoupled.py` — trains separate valence and arousal models across eight movie-level folds.
-2. `test_8fold_ensemble_on_judge.py` — loads trained models, averages their predictions on a completely held-out movie, and evaluates continuous and binary valence/arousal predictions. It additionally supports a rule-guided model (RG-MAN) and a combined ensemble. You don't need to do the rule-guided model.
+2. `test_8fold_ensemble_on_judge.py` — loads trained models, averages their predictions on a completely held-out movie, and evaluates continuous and binary valence/arousal predictions. It additionally supports a rule-guided model (RG-MAN) and a combined ensemble.
 
 The original experiment predicts **perceived valence and arousal** from precomputed video and audio features, with movie genre information. The exact neural-network layers and loss formula are defined in imported modules (`model.py`, `loss.py`, `config.py`), **not** in these two scripts. Consult those modules before claiming an exact architecture or reproducing hyperparameters.
 
 > **Scope:** This document describes what the provided code implements. The scripts themselves do not establish that every preprocessing step, threshold, or rule-prior file is free from test-label information. Those dependencies must be audited before claiming fully leakage-free evaluation.
+
+## Model architecture: Decoupled Cross-Modal Attention Network (MGN)
+
+**Source of architectural description:** The original project `README.md`, Section 4, describes the network below. The two supplied train/test scripts instantiate `PerceivedVA_Model` from `Thilok_perceive_emo_pred_model/model.py` but **do not themselves define its internal layers**. Accordingly, the diagram and dimensions below reproduce the original project's documented design; they should be checked against `model.py` and `config.py` before implementation on a new dataset.
+
+### Architecture at a glance
+
+```text
+ Video sequence: T × 768                  Audio sequence: T × 1024
+       (MViT-B)                                  (wav2vec2)
+           |                                          |
+ Linear projection 768 -> 256             Linear projection 1024 -> 256
+           |                                          |
+   Temporal BiLSTM                              Temporal BiLSTM
+   output: T × 512                              output: T × 512
+           |                                          |
+           +-------------------+----------------------+
+                               |
+                Bidirectional cross-modal attention
+                 Video attends to Audio (V <- A)
+                 Audio attends to Video (A <- V)
+                         4 attention heads
+                               |
+                  Time-varying modality gates
+                         g_v(t), g_a(t)
+                               |
+                  Gated multimodal sequence
+                               |
+                  Scene attention pooling
+                     512-dimensional vector
+                               |
+     9-dimensional multi-hot genre -> 32-dimensional embedding
+                               |
+               Concatenate: 512 + 32 = 544
+                               |
+                   Fused scene vector z
+                               |
+                +--------------+--------------+
+                |                             |
+      Valence output head              Arousal output head
+       544 -> 128 -> 1                  544 -> 128 -> 1
+        ReLU, dropout                    ReLU, dropout
+           sigmoid                          sigmoid
+                |                             |
+         Valence in [0,1]               Arousal in [0,1]
+```
+
+**Crucial training distinction:** Although the model's forward pass returns both valence and arousal, `train_8fold_no_judge_decoupled.py` creates **two separately initialized full `PerceivedVA_Model` instances per fold**. The valence specialist is optimized with the valence prediction and label; the arousal specialist is optimized with the arousal prediction and label. At test time, the valence output is taken from valence-specialist checkpoints and the arousal output from arousal-specialist checkpoints. The diagram's two heads therefore describe the model's possible outputs, **not** one shared jointly trained model used for both final predictions.
+
+### Layer-by-layer explanation
+
+**1. Input representations.** The network does not operate on raw pixels or audio waveforms in these scripts. `SceneFeatureDataset` loads precomputed temporal feature sequences. The project README identifies MViT-B video embeddings (768 features per time step) and wav2vec2 audio embeddings (1024 features per time step). The dataset loader supplies a `mask` for padded/valid sequence positions and `clip_names` for looking up labels and genre.
+
+**2. Modality-specific linear projection.** Separate learned linear layers map video `768 -> 256` and audio `1024 -> 256` into a common feature width. For a different feature extractor, update the input dimensions and confirm the projections in `model.py`.
+
+**3. Temporal BiLSTM encoders.** The project README describes a bidirectional LSTM for each modality, yielding a 512-dimensional temporal representation per time step. Forward and backward recurrence provide temporal context within the clip.
+
+**4. Bidirectional cross-modal attention.** Four attention heads allow video representations to attend to audio and audio representations to attend to video. The project describes scaled dot-product attention, conceptually:
+
+$$
+\operatorname{Attention}(Q,K,V)=\operatorname{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V.
+$$
+
+The two attention directions use different query and key/value modalities. Exact layer ordering, masking, and residual connections require inspection of `model.py`.
+
+**5. Continuous modality gating.** Rather than always trusting both modalities equally, the architecture describes learned time-varying gates $g_v(t)$ and $g_a(t)$ between 0 and 1. The original README presents the conceptual fusion as:
+
+$$
+F_t=g_v(t)\odot V_t^{\mathrm{attn}}+g_a(t)\odot A_t^{\mathrm{attn}}.
+$$
+
+This is **learned soft weighting**, not a hard rule-based clip discard. The exact gate implementation and whether the gates are normalized against each other must be checked in the model source.
+
+**6. Dominant scene attention pooling.** Attention weights over time produce one clip-level vector from the gated temporal sequence:
+
+$$
+c=\sum_{t=1}^{T}\alpha_tF_t,\qquad \sum_t\alpha_t=1.
+$$
+
+The project describes the pooled scene representation as 512-dimensional. This allows different time steps to contribute unequally to the final emotion prediction.
+
+**7. Genre conditioning.** A nine-dimensional multi-hot movie-genre vector is projected to a 32-dimensional learned embedding. Concatenating this with the pooled scene vector gives a **544-dimensional fused representation**. Genre information is loaded per clip via `load_genre_labels`. A new dataset without genre labels needs an explicit architecture change or another well-defined contextual input.
+
+**8. Prediction heads.** The documented head layout is `Linear(544,128) -> ReLU -> Dropout -> Linear(128,1) -> Sigmoid`, producing a continuous score in `[0,1]` for each emotion dimension. The test script uses these continuous scores for CCC and later thresholds them for binary accuracy.
+
+### Optimization and task-specific decoupling
+
+The training script performs:
+
+```python
+pred_v, pred_a, delta = model(video, audio, mask, genres)
+
+if task_name == "valence":
+    gt = valence_labels
+    pred = pred_v
+else:
+    gt = arousal_labels
+    pred = pred_a
+
+loss = compute_loss_task(pred, gt, delta, alpha=0.5)
+```
+
+The project README describes a hybrid objective with MSE, concordance correlation coefficient (CCC), and a temporal-change penalty:
+
+$$
+\mathcal{L}=0.5\,\mathrm{MSE}(y,\hat y)+0.5\,(1-\mathrm{CCC}(y,\hat y))
++0.01\lVert\Delta\hat y\rVert_2^2.
+$$
+
+**Verification required:** The actual training script calls `compute_loss_task(...)` from `loss.py`; the supplied files do not expose that function's implementation. Verify the exact CCC reduction, delta term, and coefficient handling in `loss.py` before treating the formula above as the executed loss.
+
+For each validation movie, the script saves the valence and arousal specialists independently according to their own best validation loss. During ensemble inference, each specialist contributes only its corresponding task prediction. This is the operational meaning of *decoupled* in the supplied training/testing workflow.
+
+### What students must carry over to another dataset
+
+- **Mandatory code:** `model.py`, `dataset.py`, `config.py`, `loss.py`, `utils.py`, plus the two supplied train/test scripts. `rule_guided_attention_model.py` is additionally imported by the unmodified test script.
+- **Input contract:** Video tensor, audio tensor, valid-time-step mask, sample identifiers, labels, and genre vectors must match the model's expected shapes and value ranges.
+- **Dimensions:** The 768/1024 input widths and 9-way genre representation are specific to the original feature pipeline. Update dimensions and associated layers if using other extractors.
+- **Output target:** The network predicts continuous valence/arousal; binary labels are created separately with a documented threshold policy.
+- **Independent models:** Preserve one valence specialist and one arousal specialist per fold if reproducing this decoupled setup; a single multitask model is a different experimental condition.
+- **Architecture validation:** Check actual tensor shapes, masking, attention implementation, and `delta` semantics against the model code before claiming an exact reproduction.
+
+---
 
 ## 1. Original dataset and experimental split
 
@@ -254,10 +376,11 @@ Students should retain the **protocol** while replacing dataset-specific assumpt
 
 ## 8. What these two scripts do *not* establish
 
-- The exact internal attention/gating/temporal architecture: inspect `model.py` and `rule_guided_attention_model.py`.
+- The exact **implemented** attention/gating/temporal architecture: the architecture section above reproduces the original project README, but must be verified against `model.py` and (for RG-MAN) `rule_guided_attention_model.py`.
 - The exact mathematical form of `compute_loss_task`: inspect `loss.py`.
 - How the original audio/video embeddings and label thresholds were generated: inspect preprocessing scripts and data files.
 - Whether the original reported numerical results reproduce: requires the actual features, labels, checkpoints, and execution environment.
 - Whether the ensemble outperforms a single full-training-pool model: requires a controlled baseline experiment.
 
 **Bottom line:** The supplied training script implements **leave-one-movie-out validation within an eight-movie training pool**, saving eight valence and eight arousal specialists. The supplied testing script implements **mean-aggregation inference on a ninth, held-out movie**, plus optional RG-MAN and blended comparisons. For another dataset, preserve the group-separated training/evaluation design while replacing all movie-specific assumptions and verifying leakage-free thresholds and preprocessing.
+
