@@ -1,4 +1,4 @@
-# term_project_perceived_emo_pred
+
 # Decoupled Valence–Arousal Prediction: Movie-Level 8-Fold Training and Ensemble Evaluation
 
 ## Purpose
